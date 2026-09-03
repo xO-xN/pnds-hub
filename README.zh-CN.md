@@ -1,8 +1,8 @@
 # PNDS 池谱中继（Telematic Hub）
 
 单文件、token 鉴权的 Socket.IO 中继，用于 PNDS 跨互联网演奏。部署在一台公网 VPS
-上，任意数量的 PNDS 站点（每台 Mac 运行 PNDS App 加一个支持互联网演奏的工程）即可
-跨网络交换消息。
+上，任意数量的 PNDS 站点（每台 Mac 运行 [PNDS App](https://github.com/xO-xN/PNDS-App)
+加一个支持互联网演奏的工程）即可跨网络交换消息。
 
 hub 刻意保持「哑」：只做鉴权、分房、回声、盖戳转发。它从不解读消息内容、不聚合
 指标、不保存状态——这让它在运维上便宜、省心，任何实现了下述瘦协议的客户端都能
@@ -10,6 +10,12 @@ hub 刻意保持「哑」：只做鉴权、分房、回声、盖戳转发。它�
 
 **它不承载音频。** 站点间实时音频由外部方案（如 JackTrip）承担；hub 只承载
 控制/数据消息。
+
+**开箱即用的基础测试。** PNDS App 内置了
+[Telematic Network Diagnostics](https://github.com/xO-xN/Telematic-Network-Diagnostics)
+工程：各站点的 Mac 在 App 里打开它（⌘O）、连上本 hub，每台 monitor 就会显示同一份
+网络视图——逐站点的 RTT、抖动、丢包，以及演出前的 go/no-go 判定。因此第一次跨
+互联网检查不需要任何自研工程；实现了下述协议的工程复用同一个 hub。
 
 ## 架构
 

@@ -2,8 +2,8 @@
 
 A single-file, token-authenticated Socket.IO relay for cross-internet PNDS
 performances. Deployed once on a public VPS, it lets any number of PNDS sites
-— each a Mac running PNDS App with a telematic score project — exchange
-messages across the internet.
+— each a Mac running [PNDS App](https://github.com/xO-xN/PNDS-App) with a
+telematic score project — exchange messages across the internet.
 
 The hub is **deliberately dumb**: it authenticates, groups clients into rooms,
 echoes, and relays with stamps. It never interprets payloads, aggregates
@@ -12,6 +12,14 @@ usable by any client that speaks the thin protocol below.
 
 **It does not carry audio.** Inter-site real-time audio is carried by external
 tooling (e.g. JackTrip); the hub carries control/data messages only.
+
+**Basic testing out of the box.** PNDS App ships with
+[Telematic Network Diagnostics](https://github.com/xO-xN/Telematic-Network-Diagnostics)
+built in: on each site's Mac, open it from the App (⌘O), point it at this
+hub, and every site's monitor shows the same network view — per-site RTT,
+jitter, and packet loss, with a go/no-go verdict before a performance. The
+first cross-internet check therefore needs no custom project; projects
+speaking the protocol below reuse the same hub.
 
 ## Architecture
 
