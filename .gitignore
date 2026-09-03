@@ -1,0 +1,4 @@
+node_modules/
+hub.env
+*.log
+.DS_Store
