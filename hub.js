@@ -6,8 +6,9 @@
  *
  * Design principle: the hub is deliberately dumb. It authenticates,
  * groups clients into rooms, echoes, and relays with stamps. It never
- * interprets payloads, aggregates metrics, or keeps state — every
- * client holds its own full picture of the network.
+ * aggregates metrics or persists performance messages — every client
+ * holds its own full picture. Optional network metadata is estimated
+ * asynchronously and held in a bounded, in-memory cache.
  *
  * What it does not carry: audio. Inter-site real-time audio is the
  * job of external tooling (e.g. JackTrip); this relay carries
@@ -16,7 +17,10 @@
  * Protocol (see "Protocol quick reference" in README.md):
  *   Handshake auth:  { token, room?, node? } — the token rides the
  *                    auth field, never the URL query string.
- *   Server emits:    welcome { room, node, hubTime }
+ *   Server emits:    welcome { room, node, hubTime, network }
+ *                    network <metadata> after lookup/manual correction
+ *   Client emits:    location { label?, latitude, longitude } | null
+ *                    optional ack { ok } — null restores the IP estimate
  *   Client emits:    echo  <any JSON> → stamped, sent back to the
  *                                      sender (RTT probing)
  *                    relay <any JSON> → stamped, forwarded to every
@@ -26,6 +30,8 @@
  *                                   overwritten — not spoofable)
  *                    hubReceivedAt = hub receive time (always
  *                                   overwritten)
+ *                    network       = hub-observed metadata, overwritten
+ *                                   only for type "tnd-stats"
  *   Auth failure:    connect_error, message "invalid hub token"
  *
  * Environment variables (hub.env under systemd):
@@ -43,6 +49,12 @@
 const crypto = require("node:crypto");
 const http = require("node:http");
 const { Server } = require("socket.io");
+const {
+  GeoLookup,
+  configuredHubLocation,
+  socketNetwork,
+  trustedProxyList,
+} = require("./lib/network-location");
 
 const VERSION = require("./package.json").version;
 const DEFAULT_ROOM = "default";
@@ -55,7 +67,10 @@ const NODE_MAX = 64; // node display-name limit, in characters
  */
 function tokenMatches(actual, expected) {
   const a = crypto.createHash("sha256").update(String(actual), "utf8").digest();
-  const b = crypto.createHash("sha256").update(String(expected), "utf8").digest();
+  const b = crypto
+    .createHash("sha256")
+    .update(String(expected), "utf8")
+    .digest();
   return crypto.timingSafeEqual(a, b);
 }
 
@@ -79,9 +94,7 @@ function sanitizeName(value, max) {
  */
 function stampedBody(payload, from, receivedAt) {
   const body =
-    payload !== null &&
-    typeof payload === "object" &&
-    !Array.isArray(payload)
+    payload !== null && typeof payload === "object" && !Array.isArray(payload)
       ? { ...payload }
       : { value: payload };
   body.from = from;
@@ -90,7 +103,17 @@ function stampedBody(payload, from, receivedAt) {
 }
 
 /** Attach the hub to an http server. Returns the socket.io Server. */
-function attachHub(httpServer, token, { log = (...a) => console.log("[hub]", ...a) } = {}) {
+function attachHub(
+  httpServer,
+  token,
+  {
+    log = (...a) => console.log("[hub]", ...a),
+    environment = {},
+    geoLookup = new GeoLookup({ apiKey: environment.HUB_GEO_API_KEY }),
+  } = {},
+) {
+  const trustedProxies = trustedProxyList(environment.HUB_TRUST_PROXY);
+  const hubLocation = configuredHubLocation(environment);
   const io = new Server(httpServer, {
     // Sites are Node processes connecting server-to-server; allow all
     // origins so browser clients may connect directly as well.
@@ -111,9 +134,27 @@ function attachHub(httpServer, token, { log = (...a) => console.log("[hub]", ...
 
   io.on("connection", (socket) => {
     const { room, node } = socket.data;
+    const network = socketNetwork(socket, {
+      lookup: (ip) => geoLookup.lookup(ip),
+      trustedProxies,
+      hubLocation,
+      onUpdate: (metadata) => socket.emit("network", metadata),
+    });
     socket.join(room);
-    socket.emit("welcome", { room, node, hubTime: Date.now() });
+    socket.emit("welcome", {
+      room,
+      node,
+      hubTime: Date.now(),
+      network: network.snapshot(),
+    });
+    // Looking up a location must never delay authentication, probes or relay.
+    void network.resolve();
     log(`join  room=${room} node=${node} id=${socket.id}`);
+
+    socket.on("location", (location, ack) => {
+      const ok = network.setLocation(location);
+      if (typeof ack === "function") ack({ ok });
+    });
 
     // RTT echo: the client sends { seq, sentAt } and computes RTT from
     // its own clock; the hub just stamps and returns — it never times
@@ -126,10 +167,15 @@ function attachHub(httpServer, token, { log = (...a) => console.log("[hub]", ...
     // clients relay one small stats snapshot per second; other
     // projects may relay whatever JSON they like.
     socket.on("relay", (payload) => {
-      socket.to(room).emit("relay", stampedBody(payload, node, Date.now()));
+      const body =
+        payload?.type === "tnd-stats"
+          ? { ...payload, network: network.snapshot() }
+          : payload;
+      socket.to(room).emit("relay", stampedBody(body, node, Date.now()));
     });
 
     socket.on("disconnect", (reason) => {
+      network.close();
       log(`leave room=${room} node=${node} id=${socket.id} reason=${reason}`);
     });
   });
@@ -140,7 +186,9 @@ function attachHub(httpServer, token, { log = (...a) => console.log("[hub]", ...
 function main() {
   const token = process.env.HUB_TOKEN;
   if (!token || !token.trim()) {
-    console.error("[hub] HUB_TOKEN is required — generate one with: openssl rand -hex 24");
+    console.error(
+      "[hub] HUB_TOKEN is required — generate one with: openssl rand -hex 24",
+    );
     process.exit(1);
   }
   const port = Number(process.env.HUB_PORT || 4000);
@@ -154,10 +202,12 @@ function main() {
     res.end(`PNDS telematic hub v${VERSION}\n`);
   });
 
-  const io = attachHub(httpServer, token);
+  const io = attachHub(httpServer, token, { environment: process.env });
 
   httpServer.listen(port, host, () => {
-    console.log(`[hub] PNDS telematic hub v${VERSION} listening on ${host}:${port}`);
+    console.log(
+      `[hub] PNDS telematic hub v${VERSION} listening on ${host}:${port}`,
+    );
   });
 
   // Graceful shutdown: close socket.io, then the http server; a 2 s
@@ -176,4 +226,10 @@ function main() {
 if (require.main === module) main();
 
 // Exported for testing.
-module.exports = { attachHub, sanitizeName, tokenMatches, stampedBody, DEFAULT_ROOM };
+module.exports = {
+  attachHub,
+  sanitizeName,
+  tokenMatches,
+  stampedBody,
+  DEFAULT_ROOM,
+};

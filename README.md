@@ -1,14 +1,15 @@
 # PNDS Telematic Hub
 
-A single-file, token-authenticated Socket.IO relay for cross-internet PNDS
+A token-authenticated Socket.IO relay for cross-internet PNDS
 performances. Deployed once on a public VPS, it lets any number of PNDS sites
 — each a Mac running [PNDS App](https://github.com/xO-xN/PNDS-App) with a
 telematic score project — exchange messages across the internet.
 
-The hub is **deliberately dumb**: it authenticates, groups clients into rooms,
-echoes, and relays with stamps. It never interprets payloads, aggregates
-metrics, or keeps state. That keeps it cheap to run, trivial to operate, and
-usable by any client that speaks the thin protocol below.
+The hub authenticates, groups clients into rooms, echoes, and relays with
+stamps. It does not aggregate metrics or persist performance messages. Its
+only extra state is a bounded in-memory cache of optional IP location
+estimates, used by the diagnostics map. Generic messages retain the same
+thin relay protocol.
 
 **It does not carry audio.** Inter-site real-time audio is carried by external
 tooling (e.g. JackTrip); the hub carries control/data messages only.
@@ -90,6 +91,58 @@ hub.example.com {
 WebSocket.) Open 443 in the firewall, keep 4000 closed. Sites connect to
 `wss://hub.example.com`.
 
+### Network locations
+
+The hub sends each authenticated connection its observed public IP and an
+optional location estimate. It queries the fixed HTTPS endpoint
+`https://api.ipapi.is/` from Node's built-in `fetch`, using a JSON POST body;
+the lookup does not block welcome, echo or relay. The provider receives the
+public IP being looked up. No Token, room, node name or manual coordinates
+are submitted. Browser clients never receive the optional provider key.
+
+Set these values in `/opt/pnds-hub/hub.env`, then restart **between
+performances**. Existing environment files are never overwritten by the
+installer.
+
+| Variable | Default / meaning |
+|---|---|
+| `HUB_GEO_API_KEY` | Optional ipapi.is key; stays on the hub |
+| `HUB_TRUST_PROXY` | Empty. Comma-separated **exact IP addresses** of trusted reverse proxies; no CIDRs or hostnames |
+| `HUB_LOCATION_LABEL` | Optional name of the actual hub deployment location |
+| `HUB_LOCATION_LATITUDE` | Deployment latitude, −90…90; requires longitude too |
+| `HUB_LOCATION_LONGITUDE` | Deployment longitude, −180…180; requires latitude too |
+
+For a local Caddy proxy connecting over `127.0.0.1`, explicitly set
+`HUB_TRUST_PROXY=127.0.0.1` (add `::1` only if used). Keep the backend port
+private. The proxy must append the actual client IP to `X-Forwarded-For`;
+the hub uses only the last entry, and only when the TCP peer is in that
+exact allowlist. Untrusted headers and handshake IP fields are ignored.
+Private, loopback and reserved addresses are never submitted to the
+provider. An unconfigured reverse proxy therefore yields unknown node
+locations rather than locating every node at the proxy.
+
+Successful estimates are cached for 24 hours, failures for five minutes;
+the LRU cache holds at most 512 addresses. Requests are deduplicated, with
+two concurrent lookups, at most 64 pending addresses and a two-second
+timeout. The hub submits at most 30 anonymous lookups per UTC day, or
+1,000 with a key. A `403` or `429` suspends further requests until the next
+UTC day. Cache and counters are in memory; restarting does not reset the
+provider's own quota, including a quota shared behind NAT. See the
+[anonymous tier](https://ipapi.is/free-tier.html) and
+[API documentation](https://ipapi.is/developers.html).
+
+IP coordinates estimate a network exit, not a physical venue, and cannot
+guarantee district accuracy. A node can correct its own location through
+the `location` event below. The correction is held for that connection;
+tools that retain it locally must resend it after reconnect. Clearing it
+restores the cached IP estimate. Location failure leaves the map position
+unknown without affecting diagnostics; topology and the node list remain
+available.
+
+The hub's own position comes **only** from deployment coordinates. With
+missing or invalid coordinates `hubLocation` is `null`; no city, including
+the prototype's Nanjing example, is inferred from the hostname or IP.
+
 ## Connecting sites
 
 Each site needs four values:
@@ -123,7 +176,7 @@ Verify the running version any time:
 
 ```bash
 curl http://127.0.0.1:4000/
-# → PNDS telematic hub v0.1.0
+# → PNDS telematic hub v0.2.0
 ```
 
 ## Protocol quick reference
@@ -136,13 +189,42 @@ with the PNDS App documentation.
 | Transport | Socket.IO v4 (WebSocket) |
 | Handshake `auth` | `{ token, room?, node? }` — the token never travels in the URL |
 | Auth failure | `connect_error`, message `"invalid hub token"` |
-| `welcome` (server → client) | `{ room, node, hubTime }` on room join |
+| `welcome` (server → client) | `{ room, node, hubTime, network }` on room join; the original three fields are unchanged |
+| `network` (server → client) | Updated metadata after automatic lookup or manual correction |
+| `location` (client → server) | `{ label?, latitude, longitude }` corrects this connection's location; `null` restores automatic location. Optional acknowledgement `{ ok: boolean }` |
 | `echo` (client → server) | any JSON → stamped, returned to the **sender only** (RTT probing) |
 | `relay` (client → server) | any JSON → stamped, sent to **every other client in the room** |
 | Stamps | `from` = authenticated sender name, `hubReceivedAt` = hub receive time — both always overwritten by the hub (sender-supplied values cannot survive) |
 | Naming | room: trimmed, ≤ 128 chars, fallback `default`; node: trimmed, ≤ 64 chars, fallback `socket.id` |
 | Payload wrap | arrays/primitives travel as `{ value: <payload> }` |
 | Delivery | ordered and reliable within a connection; messages in a reconnect gap are lost by design (silence is the outage signal) |
+
+`network` is `{ ip, location, hubLocation, manualLocationSupported: true }`.
+`ip` is the observed public IP or `null`. Each location is `null` or
+`{ label, latitude, longitude, source }`; `source` is `ip`, `manual` or
+`configured`, with `provider: "ipapi.is"` added to IP estimates. Coordinates
+are finite numbers; zero is valid. The hub rejects invalid corrections and
+overwrites any client-supplied source/provider fields.
+
+For diagnostic messages with `type: "tnd-stats"`, the hub also forcibly
+overwrites `network` with the sender's own metadata before relaying within
+the room. A sender cannot claim another public IP this way. A manually
+corrected location remains operator-provided information, not hub-verified
+physical location. Other message types keep their opaque payloads,
+including any custom field called `network`; echo behavior is unchanged.
+
+## Development checks
+
+```bash
+npm ci
+npm run check
+npm test
+```
+
+Tests inject the provider and use local loopback Socket.IO fixtures. They
+never query real participant IPs, read a deployed `hub.env`, or deploy or
+restart a service. `socket.io-client` is a test-only development dependency;
+the running hub has no new runtime dependency.
 
 ## Operations
 

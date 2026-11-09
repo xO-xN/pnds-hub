@@ -1,12 +1,11 @@
 # PNDS 池谱中继（Telematic Hub）
 
-单文件、token 鉴权的 Socket.IO 中继，用于 PNDS 跨互联网演奏。部署在一台公网 VPS
+token 鉴权的 Socket.IO 中继，用于 PNDS 跨互联网演奏。部署在一台公网 VPS
 上，任意数量的 PNDS 站点（每台 Mac 运行 [PNDS App](https://github.com/xO-xN/PNDS-App)
 加一个支持互联网演奏的工程）即可跨网络交换消息。
 
-hub 刻意保持「哑」：只做鉴权、分房、回声、盖戳转发。它从不解读消息内容、不聚合
-指标、不保存状态——这让它在运维上便宜、省心，任何实现了下述瘦协议的客户端都能
-使用。
+hub 做鉴权、分房、回声、盖戳转发，不聚合指标、不持久保存演出消息。为诊断地图
+增加的状态只有容量受限的内存 IP 位置缓存；普通消息仍使用原有的透明转发协议。
 
 **它不承载音频。** 站点间实时音频由外部方案（如 JackTrip）承担；hub 只承载
 控制/数据消息。
@@ -78,6 +77,45 @@ hub.example.com {
 （Nginx 也行——记得加 WebSocket 的 `Upgrade`/`Connection` 头。）防火墙开 443、
 关 4000。站点用 `wss://hub.example.com` 连接。
 
+### 网络位置
+
+hub 向每条已鉴权连接提供它观察到的公网 IP 和可选的估计位置。查询只在 Node 侧
+使用内建 `fetch` 向固定 HTTPS 端点 `https://api.ipapi.is/` 发送 JSON POST，
+不阻塞 welcome、echo 或 relay。定位服务会收到被查询的公网 IP；Token、房间、
+节点名和手动校正坐标不会提交。可选的定位服务 key 不会发给浏览器。
+
+在 `/opt/pnds-hub/hub.env` 中设置以下变量，**只在演出间隙重启**。安装脚本不会
+覆盖现有环境文件。
+
+| 变量 | 缺省与含义 |
+|---|---|
+| `HUB_GEO_API_KEY` | 可选的 ipapi.is key，仅保留在 hub |
+| `HUB_TRUST_PROXY` | 缺省为空；可信反向代理的**精确 IP**，逗号分隔，不接受 CIDR 或主机名 |
+| `HUB_LOCATION_LABEL` | 可选的 hub 实际部署地点名称 |
+| `HUB_LOCATION_LATITUDE` | 部署纬度，−90…90，须同时提供经度 |
+| `HUB_LOCATION_LONGITUDE` | 部署经度，−180…180，须同时提供纬度 |
+
+本机 Caddy 通过 `127.0.0.1` 连接时，显式设 `HUB_TRUST_PROXY=127.0.0.1`；实际使用
+`::1` 才把它加入。后端端口保持私有。代理必须将真实连接来源追加到
+`X-Forwarded-For`；只有 TCP 来源精确位于该名单时，hub 才使用头部最后一项。
+其他来源的头部和握手 IP 字段一律忽略。私网、回环和保留地址不会提交定位服务。
+未配置可信代理时，节点位置显示未知，不会把所有节点误放到代理所在地。
+
+成功结果缓存 24 小时，失败退避五分钟；LRU 缓存最多 512 个地址。相同 IP 查询
+合并，最多两个查询并发、64 个地址等待，每次两秒超时。每个 UTC 自然日，匿名最多
+提交 30 次、有 key 最多 1,000 次；收到 `403` 或 `429` 后停止新请求，直到下一个
+UTC 自然日。缓存与计数只在内存中，重启不会重置服务商的实际额度；共享 NAT 也
+可能共用服务商额度。依据见[匿名额度说明](https://ipapi.is/free-tier.html)及
+[API 文档](https://ipapi.is/developers.html)。
+
+IP 坐标估计的是公网出口，不保证区县或演出场地精度。节点可以通过下述 `location`
+事件校正自己的位置。hub 仅为当前连接保留校正；工具若在本机记住校正，重连后须
+再次发送。清除校正恢复已缓存的 IP 估计。定位失败不影响网络诊断，只将位置标为
+未知；仍可使用拓扑图和节点列表。
+
+hub 自身位置**只取部署坐标配置**。坐标缺失或无效时 `hubLocation` 为 `null`，
+不会按域名或 IP 推断城市，也不会沿用原型中的南京示例。
+
 ## 站点接入
 
 每个站点需要四个值：
@@ -108,7 +146,7 @@ sudo /opt/pnds-hub/update.sh v0.2.0     # 更新到指定 tag
 
 ```bash
 curl http://127.0.0.1:4000/
-# → PNDS telematic hub v0.1.0
+# → PNDS telematic hub v0.2.0
 ```
 
 ## 协议速查
@@ -120,13 +158,38 @@ curl http://127.0.0.1:4000/
 | 传输 | Socket.IO v4（WebSocket） |
 | 握手 `auth` | `{ token, room?, node? }`——token 绝不进 URL |
 | 鉴权失败 | `connect_error`，message 为 `"invalid hub token"` |
-| `welcome`（服务端 → 客户端） | 入房时发 `{ room, node, hubTime }` |
+| `welcome`（服务端 → 客户端） | 入房时发 `{ room, node, hubTime, network }`；原有三个字段不变 |
+| `network`（服务端 → 客户端） | 自动定位完成或手动校正后的新元数据 |
+| `location`（客户端 → 服务端） | `{ label?, latitude, longitude }` 校正当前连接位置；`null` 恢复自动定位；可选 ack 为 `{ ok: boolean }` |
 | `echo`（客户端 → 服务端） | 任意 JSON → 盖戳后**只发回发送者**（测 RTT） |
 | `relay`（客户端 → 服务端） | 任意 JSON → 盖戳后发给**同房间其他所有客户端** |
 | 盖戳 | `from` = 经鉴权的发送者名，`hubReceivedAt` = hub 接收时刻——两个键都由 hub 强制覆盖（发送者自带的值无法存活） |
 | 命名 | room：trim 后 ≤ 128 字符，回退 `default`；node：trim 后 ≤ 64 字符，回退 `socket.id` |
 | 载荷包裹 | 数组/原始值以 `{ value: <payload> }` 形式传输 |
 | 投递语义 | 单条连接内有序可靠；重连间隙的消息按设计丢弃（沉默即断线信号） |
+
+`network` 为 `{ ip, location, hubLocation, manualLocationSupported: true }`。
+`ip` 是观察到的公网 IP，未知为 `null`；两个位置字段各自为 `null` 或
+`{ label, latitude, longitude, source }`。`source` 分别为 `ip`、`manual` 或
+`configured`；IP 估计另带 `provider: "ipapi.is"`。坐标必须是有限数值，零有效。
+hub 拒绝非法校正，并覆盖客户端自带的 source/provider。
+
+对 `type: "tnd-stats"` 的诊断消息，hub 在同房间转发前额外强制覆盖 `network`，
+使用当前发送连接的元数据，发送者不能借此冒充别人的公网 IP。手动校正仍是操作者
+提供的信息，不是 hub 验证过的真实机位。其他消息类型继续透明转发，包括自定义的
+`network` 字段；echo 行为不变。
+
+## 开发检查
+
+```bash
+npm ci
+npm run check
+npm test
+```
+
+测试注入定位服务响应，并使用本机回环 Socket.IO fixture；不查询真实参与者 IP、
+不读取部署的 `hub.env`，也不部署或重启服务。`socket.io-client` 仅作为测试开发依赖，
+运行中的 hub 不增加依赖。
 
 ## 运维
 

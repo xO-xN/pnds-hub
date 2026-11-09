@@ -54,6 +54,14 @@ HUB_TOKEN=$TOKEN
 # set HUB_HOST=0.0.0.0 and restart the service.
 HUB_HOST=127.0.0.1
 HUB_PORT=4000
+# Optional network-map metadata (see README "Network locations").
+# Trust only the exact TCP address of a proxy that appends the client IP.
+# HUB_TRUST_PROXY=127.0.0.1
+# HUB_GEO_API_KEY=
+# Configure the hub's actual deployment location; otherwise it is unknown.
+# HUB_LOCATION_LABEL=
+# HUB_LOCATION_LATITUDE=
+# HUB_LOCATION_LONGITUDE=
 EOF
   chmod 600 "$ENV_FILE"
   GENERATED=yes

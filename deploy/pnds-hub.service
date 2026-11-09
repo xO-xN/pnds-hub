@@ -15,7 +15,7 @@ ExecStart=/usr/bin/env node hub.js
 Restart=always
 RestartSec=2
 
-# Sandboxing: the hub is stateless at runtime (journal logging only),
+# Sandboxing: only ephemeral IP-location cache and journal logging,
 # so it runs as a transient user with a read-only view of the system.
 DynamicUser=yes
 NoNewPrivileges=true
